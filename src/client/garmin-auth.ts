@@ -175,6 +175,14 @@ export class GarminAuth {
   }
 
   private async login(): Promise<void> {
+    if (!this.email || !this.password) {
+      throw new Error(
+        'Garmin Connect credentials are not configured. ' +
+        'Set GARMIN_EMAIL and GARMIN_PASSWORD as Cloudflare Worker secrets, ' +
+        'or provide them via Basic Auth (Client ID = email, Client Secret = password).',
+      );
+    }
+
     console.error('Authenticating with Garmin Connect...');
 
     await this.fetchOAuthConsumer();
