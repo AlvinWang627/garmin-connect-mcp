@@ -62,6 +62,22 @@ function corsHeaders(origin?: string | null): Record<string, string> {
   };
 }
 
+function parseBasicAuth(authHeader: string | null): { username?: string; password?: string } | null {
+  if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+  try {
+    const base64 = authHeader.substring(6).trim();
+    const decoded = atob(base64);
+    const index = decoded.indexOf(':');
+    if (index === -1) return { username: decoded, password: '' };
+    return {
+      username: decoded.substring(0, index),
+      password: decoded.substring(index + 1),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -92,12 +108,14 @@ export default {
       );
     }
 
+    const authHeader = request.headers.get('Authorization');
+    const apiKeyHeader = request.headers.get('x-api-key');
+    const queryToken = url.searchParams.get('token') || url.searchParams.get('auth_token');
+    const basicAuth = parseBasicAuth(authHeader);
+
     if (env.AUTH_TOKEN) {
-      const authHeader = request.headers.get('Authorization');
-      const apiKeyHeader = request.headers.get('x-api-key');
-      const queryToken = url.searchParams.get('token') || url.searchParams.get('auth_token');
       const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null;
-      const providedToken = bearerToken || apiKeyHeader || queryToken;
+      const providedToken = bearerToken || apiKeyHeader || queryToken || basicAuth?.password || basicAuth?.username;
 
       if (!providedToken || providedToken !== env.AUTH_TOKEN) {
         return new Response(
@@ -110,13 +128,18 @@ export default {
       }
     }
 
-    const email = env.GARMIN_EMAIL;
-    const password = env.GARMIN_PASSWORD;
+    let email = env.GARMIN_EMAIL;
+    let password = env.GARMIN_PASSWORD;
+
+    if (basicAuth?.username && basicAuth?.password) {
+      email = basicAuth.username;
+      password = basicAuth.password;
+    }
 
     if (!email || !password) {
       return new Response(
         JSON.stringify({
-          error: 'Configuration Error: GARMIN_EMAIL and GARMIN_PASSWORD must be configured as Worker secrets or environment variables.',
+          error: 'Configuration Error: GARMIN_EMAIL and GARMIN_PASSWORD must be configured as Worker secrets or provided via Basic Auth credentials.',
         }),
         {
           status: 500,
@@ -129,10 +152,10 @@ export default {
       ? new KVTokenStorage(env.GARMIN_TOKENS)
       : memoryStorage;
 
+    const acceptHeader = request.headers.get('Accept') || '';
     const isSseGet = request.method === 'GET' && (
       url.pathname === '/sse' ||
-      url.pathname === '/' ||
-      request.headers.get('Accept')?.includes('text/event-stream')
+      acceptHeader.includes('text/event-stream')
     );
 
     if (isSseGet) {
@@ -201,16 +224,31 @@ export default {
       }
     }
 
+    // Direct JSON-RPC POST (Streamable HTTP / Gemini / Cursor)
+    const normalizedHeaders = new Headers(request.headers);
+    if (!normalizedHeaders.get('Accept')?.includes('application/json') || !normalizedHeaders.get('Accept')?.includes('text/event-stream')) {
+      normalizedHeaders.set('Accept', 'application/json, text/event-stream');
+    }
+
     const client = new GarminClient(email, password, undefined, tokenStorage);
     const server = createGarminMcpServer(client);
 
     const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => crypto.randomUUID(),
+      sessionIdGenerator: undefined, // Stateless mode for direct JSON-RPC HTTP requests
+      enableJsonResponse: true,
     });
 
     await server.connect(transport);
 
-    const response = await transport.handleRequest(request);
+    const normalizedReq = new Request(request.url, {
+      method: request.method,
+      headers: normalizedHeaders,
+      body: request.body,
+      // @ts-ignore
+      duplex: 'half',
+    });
+
+    const response = await transport.handleRequest(normalizedReq);
 
     const responseHeaders = new Headers(response.headers);
     for (const [key, value] of Object.entries(headers)) {
