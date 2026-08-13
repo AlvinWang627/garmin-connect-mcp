@@ -3,9 +3,13 @@ import { wrapper } from 'axios-cookiejar-support';
 import { CookieJar } from 'tough-cookie';
 import OAuth from 'oauth-1.0a';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
+import {
+  FileTokenStorage,
+  type TokenStorage,
+  type OAuth1Token,
+  type OAuth2Token,
+  type UserProfile,
+} from './storage';
 
 const OAUTH_CONSUMER_URL = 'https://thegarth.s3.amazonaws.com/oauth_consumer.json';
 const SSO_EMBED = 'https://sso.garmin.com/sso/embed';
@@ -28,37 +32,12 @@ const TICKET_REGEX = /ticket=([^"]+)"/;
 const TITLE_REGEX = /<title>(.+?)<\/title>/;
 const SSO_VERIFY_MFA = 'https://sso.garmin.com/sso/verifyMFA/loginEnterMfaCode';
 
-const TOKEN_DIR = path.join(os.homedir(), '.garmin-mcp');
-const OAUTH1_TOKEN_FILE = 'oauth1_token.json';
-const OAUTH2_TOKEN_FILE = 'oauth2_token.json';
-const PROFILE_FILE = 'profile.json';
-
 const MAX_REQUEST_RETRIES = 3;
 const TOKEN_EXPIRY_BUFFER_SECONDS = 60;
-
-type OAuth1Token = {
-  oauth_token: string;
-  oauth_token_secret: string;
-};
-
-type OAuth2Token = {
-  access_token: string;
-  refresh_token: string;
-  token_type: string;
-  expires_in: number;
-  expires_at: number;
-  refresh_token_expires_in: number;
-  refresh_token_expires_at: number;
-};
 
 type OAuthConsumer = {
   consumer_key: string;
   consumer_secret: string;
-};
-
-type UserProfile = {
-  displayName: string;
-  profileId: number;
 };
 
 export type RequestOptions = {
@@ -76,6 +55,8 @@ export class GarminAuth {
   private profile: UserProfile | null = null;
   private isAuthenticated = false;
   private promptMfa?: () => Promise<string>;
+  private tokenStorage: TokenStorage;
+  private tokensLoaded = false;
 
   get displayName(): string {
     return this.profile?.displayName ?? '';
@@ -85,11 +66,16 @@ export class GarminAuth {
     return this.profile?.profileId ?? 0;
   }
 
-  constructor(email: string, password: string, promptMfa?: () => Promise<string>) {
+  constructor(
+    email: string,
+    password: string,
+    promptMfa?: () => Promise<string>,
+    tokenStorage?: TokenStorage,
+  ) {
     this.email = email;
     this.password = password;
     this.promptMfa = promptMfa;
-    this.loadTokens();
+    this.tokenStorage = tokenStorage ?? new FileTokenStorage();
   }
 
   async request<T>(endpoint: string, options?: RequestOptions): Promise<T> {
@@ -141,6 +127,8 @@ export class GarminAuth {
   }
 
   private async ensureAuthenticated(): Promise<void> {
+    await this.loadTokens();
+
     if (this.isAuthenticated && this.oauth2Token && !this.isOAuth2Expired() && this.profile) return;
 
     if (this.oauth1Token && this.oauth2Token && !this.isOAuth2Expired() && this.profile) {
@@ -150,7 +138,7 @@ export class GarminAuth {
 
     if (this.oauth1Token && this.oauth2Token && !this.isOAuth2Expired() && !this.profile) {
       await this.fetchProfile();
-      this.saveTokens();
+      await this.saveTokens();
       this.isAuthenticated = true;
       return;
     }
@@ -158,7 +146,7 @@ export class GarminAuth {
     if (this.oauth1Token) {
       await this.exchangeOAuth1ForOAuth2();
       await this.fetchProfile();
-      this.saveTokens();
+      await this.saveTokens();
       this.isAuthenticated = true;
       return;
     }
@@ -174,7 +162,7 @@ export class GarminAuth {
       try {
         await this.exchangeOAuth1ForOAuth2();
         if (!this.profile) await this.fetchProfile();
-        this.saveTokens();
+        await this.saveTokens();
         this.isAuthenticated = true;
         return;
       } catch (error) {
@@ -194,7 +182,7 @@ export class GarminAuth {
     await this.exchangeTicketForOAuth1(ticket);
     await this.exchangeOAuth1ForOAuth2();
     await this.fetchProfile();
-    this.saveTokens();
+    await this.saveTokens();
 
     console.error('Authentication successful');
   }
@@ -405,53 +393,33 @@ export class GarminAuth {
     return this.oauth2Token.expires_at < Math.floor(Date.now() / 1000) + TOKEN_EXPIRY_BUFFER_SECONDS;
   }
 
-  private loadTokens(): void {
+  private async loadTokens(): Promise<void> {
+    if (this.tokensLoaded) return;
     try {
-      const oauth1Path = path.join(TOKEN_DIR, OAUTH1_TOKEN_FILE);
-      const oauth2Path = path.join(TOKEN_DIR, OAUTH2_TOKEN_FILE);
-      const profilePath = path.join(TOKEN_DIR, PROFILE_FILE);
-
-      if (fs.existsSync(oauth1Path)) {
-        this.oauth1Token = JSON.parse(fs.readFileSync(oauth1Path, 'utf-8'));
-      }
-      if (fs.existsSync(oauth2Path)) {
-        this.oauth2Token = JSON.parse(fs.readFileSync(oauth2Path, 'utf-8'));
-      }
-      if (fs.existsSync(profilePath)) {
-        this.profile = JSON.parse(fs.readFileSync(profilePath, 'utf-8'));
+      const stored = await this.tokenStorage.load();
+      if (stored) {
+        if (stored.oauth1Token) this.oauth1Token = stored.oauth1Token;
+        if (stored.oauth2Token) this.oauth2Token = stored.oauth2Token;
+        if (stored.profile) this.profile = stored.profile;
       }
     } catch {
       this.oauth1Token = null;
       this.oauth2Token = null;
       this.profile = null;
+    } finally {
+      this.tokensLoaded = true;
     }
   }
 
-  private saveTokens(): void {
-    if (!fs.existsSync(TOKEN_DIR)) {
-      fs.mkdirSync(TOKEN_DIR, { recursive: true, mode: 0o700 });
-    }
-
-    if (this.oauth1Token) {
-      fs.writeFileSync(
-        path.join(TOKEN_DIR, OAUTH1_TOKEN_FILE),
-        JSON.stringify(this.oauth1Token, null, 2),
-        { mode: 0o600 },
-      );
-    }
-    if (this.oauth2Token) {
-      fs.writeFileSync(
-        path.join(TOKEN_DIR, OAUTH2_TOKEN_FILE),
-        JSON.stringify(this.oauth2Token, null, 2),
-        { mode: 0o600 },
-      );
-    }
-    if (this.profile) {
-      fs.writeFileSync(
-        path.join(TOKEN_DIR, PROFILE_FILE),
-        JSON.stringify(this.profile, null, 2),
-        { mode: 0o600 },
-      );
+  private async saveTokens(): Promise<void> {
+    try {
+      await this.tokenStorage.save({
+        oauth1Token: this.oauth1Token,
+        oauth2Token: this.oauth2Token,
+        profile: this.profile,
+      });
+    } catch (e) {
+      console.error('Failed to save tokens:', e);
     }
   }
 }

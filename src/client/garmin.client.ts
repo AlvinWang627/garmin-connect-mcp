@@ -1,4 +1,5 @@
 import { GarminAuth, type RequestOptions } from './garmin-auth';
+import type { TokenStorage } from './storage';
 import {
   USER_SUMMARY_ENDPOINT,
   HEART_RATE_ENDPOINT,
@@ -102,8 +103,13 @@ function todayString(): string {
 export class GarminClient {
   private auth: GarminAuth;
 
-  constructor(email: string, password: string, promptMfa?: () => Promise<string>) {
-    this.auth = new GarminAuth(email, password, promptMfa);
+  constructor(
+    email: string,
+    password: string,
+    promptMfa?: () => Promise<string>,
+    tokenStorage?: TokenStorage,
+  ) {
+    this.auth = new GarminAuth(email, password, promptMfa, tokenStorage);
   }
 
   private request<T>(endpoint: string, options?: RequestOptions): Promise<T> {

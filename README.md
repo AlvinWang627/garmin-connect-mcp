@@ -211,6 +211,52 @@ To test locally:
 GARMIN_EMAIL=you@email.com GARMIN_PASSWORD=yourpass npm start
 ```
 
+## Deployment to Cloudflare Workers
+
+You can deploy this MCP server directly to Cloudflare Workers to serve MCP clients over HTTP / SSE (Server-Sent Events).
+
+### 1. Configure Cloudflare Secrets
+
+Login to Cloudflare and set your Garmin credentials as worker secrets:
+
+```bash
+npx wrangler login
+
+# Set required secrets
+npx wrangler secret put GARMIN_EMAIL
+npx wrangler secret put GARMIN_PASSWORD
+
+# (Optional) Set secret bearer token to restrict access
+npx wrangler secret put AUTH_TOKEN
+```
+
+### 2. (Optional) Set up Cloudflare KV for Token Persistence
+
+To persist OAuth tokens across Worker invocations, create a KV namespace:
+
+```bash
+npm run kv:create
+```
+
+Add the generated namespace ID to `wrangler.jsonc`:
+
+```jsonc
+"kv_namespaces": [
+  {
+    "binding": "GARMIN_TOKENS",
+    "id": "<YOUR_KV_NAMESPACE_ID>"
+  }
+]
+```
+
+### 3. Deploy
+
+```bash
+npm run deploy
+```
+
+Once deployed, your worker URL (`https://garmin-connect-mcp.<subdomain>.workers.dev`) can be used as an HTTP/SSE MCP endpoint in compatible MCP clients.
+
 ## Credits
 
 - API endpoints and authentication flow based on [`python-garminconnect`](https://github.com/cyberjunky/python-garminconnect) by [cyberjunky](https://github.com/cyberjunky)
@@ -218,3 +264,4 @@ GARMIN_EMAIL=you@email.com GARMIN_PASSWORD=yourpass npm start
 ## License
 
 MIT
+

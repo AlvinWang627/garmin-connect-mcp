@@ -15,6 +15,10 @@
     "dev": "tsup --watch",
     "start": "node build/index.js",
     "setup": "node build/setup.js",
+    "test": "vitest run src/storage.test.ts src/worker.test.ts",
+    "dev:worker": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "kv:create": "wrangler kv namespace create GARMIN_TOKENS",
     "prepublishOnly": "tsup"
   },
   "keywords": [
@@ -36,11 +40,13 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260813.1",
     "@types/node": "^22.13.4",
     "@types/tough-cookie": "^4.0.5",
     "dotenv": "^17.3.1",
     "tsup": "^8.5.1",
     "typescript": "^5.7.3",
-    "vitest": "^4.0.18"
+    "vitest": "^4.0.18",
+    "wrangler": "^4.123.0"
   }
 }
