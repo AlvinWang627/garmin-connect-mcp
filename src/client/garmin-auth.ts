@@ -27,9 +27,9 @@ const SSO_WIDGET_ID = 'gauth-widget';
 const USER_AGENT_MOBILE = 'com.garmin.android.apps.connectmobile';
 const USER_AGENT_BROWSER = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-const CSRF_REGEX = /name="_csrf"\s+value="(.+?)"/;
-const TICKET_REGEX = /ticket=([^"]+)"/;
-const TITLE_REGEX = /<title>(.+?)<\/title>/;
+const CSRF_REGEX = /name=["']_csrf["'][^>]*value=["'](.+?)["']/i;
+const TICKET_REGEX = /(?:[?&]|\b)ticket=([^"'&<\s]+)/i;
+const TITLE_REGEX = /<title[^>]*>([\s\S]*?)<\/title>/i;
 const SSO_VERIFY_MFA = 'https://sso.garmin.com/sso/verifyMFA/loginEnterMfaCode';
 
 const MAX_REQUEST_RETRIES = 3;
@@ -50,6 +50,39 @@ type SigninParams = {
 type LoginState =
   | { kind: 'ticket'; ticket: string }
   | { kind: 'mfa'; challenge: GarminMfaChallenge };
+
+function isMfaResponse(html: string, title: string): boolean {
+  const lowerHtml = html.toLowerCase();
+  const lowerTitle = title.toLowerCase();
+
+  return lowerTitle.includes('mfa')
+    || lowerHtml.includes('loginentermfacode')
+    || lowerHtml.includes('verifymfa')
+    || lowerHtml.includes('submit-mfa-verification-code-form')
+    || lowerHtml.includes('name="mfa-code"')
+    || lowerHtml.includes("name='mfa-code'")
+    || lowerHtml.includes('id="mfa-code"')
+    || lowerHtml.includes("id='mfa-code'")
+    || lowerHtml.includes('enter security code')
+    || lowerHtml.includes('security code')
+    || lowerHtml.includes('code sent to')
+    || lowerHtml.includes('verification code')
+    || /mfarequired\s*[=:"']+\s*true/i.test(html)
+    || /performmfacheck\s*[=:"']+\s*true/i.test(html);
+}
+
+function getResponseUrl(response: unknown): string {
+  const request = (response as {
+    request?: {
+      responseURL?: unknown;
+      res?: { responseUrl?: unknown };
+    };
+  }).request;
+
+  if (typeof request?.responseURL === 'string') return request.responseURL;
+  if (typeof request?.res?.responseUrl === 'string') return request.res.responseUrl;
+  return '';
+}
 
 /**
  * Serializable state returned when Garmin pauses login for MFA.
@@ -372,8 +405,10 @@ export class GarminAuth {
 
     const titleMatch = TITLE_REGEX.exec(responseHtml);
     const title = titleMatch?.[1] ?? '';
+    const responseUrl = getResponseUrl(loginResponse);
+    const responseUrlIsMfa = /loginentermfacode|verifymfa/i.test(responseUrl);
 
-    if (title.includes('MFA')) {
+    if (isMfaResponse(responseHtml, title) || responseUrlIsMfa) {
       const mfaCsrfMatch = CSRF_REGEX.exec(responseHtml);
       if (!mfaCsrfMatch) throw new Error('Failed to extract CSRF token for MFA');
 
@@ -395,7 +430,14 @@ export class GarminAuth {
     }
 
     const ticketMatch = TICKET_REGEX.exec(responseHtml);
-    if (!ticketMatch) throw new Error('Login failed: invalid credentials or MFA verification failed');
+    if (!ticketMatch) {
+      const normalizedTitle = title.replace(/\s+/g, ' ').trim();
+      throw new Error(
+        normalizedTitle
+          ? `Login failed: Garmin returned the page "${normalizedTitle}" without a service ticket; check credentials or wait if Garmin SSO is rate-limiting the account`
+          : 'Login failed: Garmin did not return a service ticket; check credentials or wait if Garmin SSO is rate-limiting the account',
+      );
+    }
 
     return { kind: 'ticket', ticket: ticketMatch[1]! };
   }
