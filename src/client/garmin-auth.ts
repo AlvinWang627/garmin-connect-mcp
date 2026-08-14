@@ -56,6 +56,8 @@ function isMfaResponse(html: string, title: string): boolean {
   const lowerTitle = title.toLowerCase();
 
   return lowerTitle.includes('mfa')
+    // Garmin email MFA uses this title instead of a title containing "MFA".
+    || lowerTitle.includes('authentication application')
     || lowerHtml.includes('loginentermfacode')
     || lowerHtml.includes('verifymfa')
     || lowerHtml.includes('submit-mfa-verification-code-form')
