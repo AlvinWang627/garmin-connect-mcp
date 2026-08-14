@@ -20,6 +20,28 @@ describe('Worker Handler', () => {
     expect(body.service).toBe('garmin-connect-mcp');
   });
 
+  it('protects the remote MFA enrollment endpoints', async () => {
+    const req = new Request('http://localhost/auth/mfa/start', { method: 'POST' });
+    const res = await worker.fetch(req, { MFA_ADMIN_TOKEN: 'admin-secret' });
+
+    expect(res.status).toBe(401);
+    const body = await res.json() as { error: string };
+    expect(body.error).toBe('Unauthorized');
+  });
+
+  it('requires KV before starting remote MFA enrollment', async () => {
+    const req = new Request('http://localhost/auth/mfa/start', {
+      method: 'POST',
+      headers: { 'x-mfa-admin-token': 'admin-secret', 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const res = await worker.fetch(req, { MFA_ADMIN_TOKEN: 'admin-secret' });
+
+    expect(res.status).toBe(503);
+    const body = await res.json() as { error: string };
+    expect(body.error).toContain('GARMIN_TOKENS');
+  });
+
   it('handles POST initialize without credentials (MCP handshake works without Garmin auth)', async () => {
     const initPayload = {
       jsonrpc: '2.0',

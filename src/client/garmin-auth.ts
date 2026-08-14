@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { wrapper } from 'axios-cookiejar-support';
-import { CookieJar } from 'tough-cookie';
+import { CookieJar, type SerializedCookieJar } from 'tough-cookie';
 import OAuth from 'oauth-1.0a';
 import crypto from 'node:crypto';
 import {
@@ -40,6 +40,32 @@ type OAuthConsumer = {
   consumer_secret: string;
 };
 
+type SigninParams = {
+  id: string;
+  embedWidget: boolean;
+  locale: string;
+  gauthHost: string;
+};
+
+type LoginState =
+  | { kind: 'ticket'; ticket: string }
+  | { kind: 'mfa'; challenge: GarminMfaChallenge };
+
+/**
+ * Serializable state returned when Garmin pauses login for MFA.
+ * It contains the SSO cookies and CSRF token needed by the next request,
+ * but never the Garmin password.
+ */
+export type GarminMfaChallenge = {
+  version: 1;
+  email: string;
+  createdAt: number;
+  expiresAt: number;
+  mfaCsrfToken: string;
+  signinParams: SigninParams;
+  cookieJar: SerializedCookieJar;
+};
+
 export type RequestOptions = {
   method?: string;
   body?: unknown;
@@ -76,6 +102,71 @@ export class GarminAuth {
     this.password = password;
     this.promptMfa = promptMfa;
     this.tokenStorage = tokenStorage ?? new FileTokenStorage();
+  }
+
+  /**
+   * Starts a login for a remote caller. If Garmin requires MFA, the caller
+   * receives a serializable challenge and can complete it later with
+   * verifyMfa(). If MFA is not required, authentication is completed here.
+   */
+  async startMfaLogin(): Promise<GarminMfaChallenge | null> {
+    this.validateCredentials();
+    await this.fetchOAuthConsumer();
+
+    const state = await this.beginLogin();
+    if (state.kind === 'mfa') return state.challenge;
+
+    await this.finishTicketLogin(state.ticket);
+    this.isAuthenticated = true;
+    return null;
+  }
+
+  /** Completes a previously started remote MFA login and saves the tokens. */
+  async verifyMfa(challenge: GarminMfaChallenge, code: string): Promise<void> {
+    if (!this.email || challenge.email !== this.email) {
+      throw new Error('MFA challenge does not belong to this account');
+    }
+    if (!code || !/^\d{4,12}$/.test(code.trim())) {
+      throw new Error('MFA code must contain 4 to 12 digits');
+    }
+    if (challenge.version !== 1 || Date.now() >= challenge.expiresAt) {
+      throw new Error('MFA challenge has expired');
+    }
+
+    await this.fetchOAuthConsumer();
+    const ssoClient = wrapper(axios.create({
+      jar: CookieJar.fromJSON(challenge.cookieJar),
+      withCredentials: true,
+    }));
+
+    const mfaResponse = await ssoClient.post(SSO_VERIFY_MFA, new URLSearchParams({
+      'mfa-code': code.trim(),
+      embed: 'true',
+      _csrf: challenge.mfaCsrfToken,
+      fromPage: 'setupEnterMfaCode',
+    }).toString(), {
+      params: {
+        ...challenge.signinParams,
+        clientId: SSO_CLIENT_ID,
+        service: SSO_EMBED,
+        source: SSO_EMBED,
+        redirectAfterAccountLoginUrl: SSO_EMBED,
+        redirectAfterAccountCreationUrl: SSO_EMBED,
+      },
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': USER_AGENT_BROWSER,
+        Origin: SSO_ORIGIN,
+        Referer: SSO_SIGNIN,
+        Dnt: '1',
+      },
+    });
+
+    const ticketMatch = TICKET_REGEX.exec(String(mfaResponse.data));
+    if (!ticketMatch) throw new Error('MFA verification failed; check the latest code from Garmin');
+
+    await this.finishTicketLogin(ticketMatch[1]!);
+    this.isAuthenticated = true;
   }
 
   async request<T>(endpoint: string, options?: RequestOptions): Promise<T> {
@@ -175,6 +266,28 @@ export class GarminAuth {
   }
 
   private async login(): Promise<void> {
+    this.validateCredentials();
+
+    console.error('Authenticating with Garmin Connect...');
+
+    await this.fetchOAuthConsumer();
+
+    const state = await this.beginLogin();
+    if (state.kind === 'mfa') {
+      if (!this.promptMfa) {
+        throw new Error(
+          'MFA is required but no MFA handler is available. Run the interactive setup or use the remote MFA setup endpoint.',
+        );
+      }
+      await this.completeMfaLogin(state.challenge, await this.promptMfa());
+    } else {
+      await this.finishTicketLogin(state.ticket);
+    }
+
+    console.error('Authentication successful');
+  }
+
+  private validateCredentials(): void {
     if (!this.email || !this.password) {
       throw new Error(
         'Garmin Connect credentials are not configured. ' +
@@ -182,17 +295,6 @@ export class GarminAuth {
         'or provide them via Basic Auth (Client ID = email, Client Secret = password).',
       );
     }
-
-    console.error('Authenticating with Garmin Connect...');
-
-    await this.fetchOAuthConsumer();
-    const ticket = await this.getLoginTicket();
-    await this.exchangeTicketForOAuth1(ticket);
-    await this.exchangeOAuth1ForOAuth2();
-    await this.fetchProfile();
-    await this.saveTokens();
-
-    console.error('Authentication successful');
   }
 
   private async fetchProfile(): Promise<void> {
@@ -218,7 +320,7 @@ export class GarminAuth {
     this.consumer = response.data;
   }
 
-  private async getLoginTicket(): Promise<string> {
+  private async beginLogin(): Promise<LoginState> {
     const jar = new CookieJar();
     const ssoClient = wrapper(axios.create({ jar, withCredentials: true }));
 
@@ -227,7 +329,7 @@ export class GarminAuth {
       headers: { 'User-Agent': USER_AGENT_BROWSER },
     });
 
-    const signinParams = {
+    const signinParams: SigninParams = {
       id: SSO_WIDGET_ID,
       embedWidget: true,
       locale: SSO_LOCALE,
@@ -266,53 +368,47 @@ export class GarminAuth {
       },
     });
 
-    let responseHtml: string = loginResponse.data;
+    const responseHtml: string = loginResponse.data;
 
     const titleMatch = TITLE_REGEX.exec(responseHtml);
     const title = titleMatch?.[1] ?? '';
 
     if (title.includes('MFA')) {
-      if (!this.promptMfa) {
-        throw new Error(
-          'MFA is required but no MFA handler is available. Run "npx @nicolasvegam/garmin-connect-mcp setup" to authenticate interactively.',
-        );
-      }
-
       const mfaCsrfMatch = CSRF_REGEX.exec(responseHtml);
       if (!mfaCsrfMatch) throw new Error('Failed to extract CSRF token for MFA');
 
-      const mfaCode = await this.promptMfa();
+      const cookieJar = jar.toJSON();
+      if (!cookieJar) throw new Error('Failed to serialize Garmin MFA session');
 
-      const mfaResponse = await ssoClient.post(SSO_VERIFY_MFA, new URLSearchParams({
-        'mfa-code': mfaCode,
-        embed: 'true',
-        _csrf: mfaCsrfMatch[1]!,
-        fromPage: 'setupEnterMfaCode',
-      }).toString(), {
-        params: {
-          ...signinParams,
-          clientId: SSO_CLIENT_ID,
-          service: SSO_EMBED,
-          source: SSO_EMBED,
-          redirectAfterAccountLoginUrl: SSO_EMBED,
-          redirectAfterAccountCreationUrl: SSO_EMBED,
+      return {
+        kind: 'mfa',
+        challenge: {
+          version: 1,
+          email: this.email,
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 10 * 60 * 1000,
+          mfaCsrfToken: mfaCsrfMatch[1]!,
+          signinParams,
+          cookieJar,
         },
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': USER_AGENT_BROWSER,
-          Origin: SSO_ORIGIN,
-          Referer: SSO_SIGNIN,
-          Dnt: '1',
-        },
-      });
-
-      responseHtml = mfaResponse.data;
+      };
     }
 
     const ticketMatch = TICKET_REGEX.exec(responseHtml);
     if (!ticketMatch) throw new Error('Login failed: invalid credentials or MFA verification failed');
 
-    return ticketMatch[1]!;
+    return { kind: 'ticket', ticket: ticketMatch[1]! };
+  }
+
+  private async completeMfaLogin(challenge: GarminMfaChallenge, code: string): Promise<void> {
+    await this.verifyMfa(challenge, code);
+  }
+
+  private async finishTicketLogin(ticket: string): Promise<void> {
+    await this.exchangeTicketForOAuth1(ticket);
+    await this.exchangeOAuth1ForOAuth2();
+    await this.fetchProfile();
+    await this.saveTokens();
   }
 
   private async exchangeTicketForOAuth1(ticket: string): Promise<void> {

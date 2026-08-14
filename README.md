@@ -230,9 +230,10 @@ npx wrangler secret put GARMIN_PASSWORD
 npx wrangler secret put AUTH_TOKEN
 ```
 
-### 2. (Optional) Set up Cloudflare KV for Token Persistence
+### 2. Set up Cloudflare KV for Token Persistence
 
-To persist OAuth tokens across Worker invocations, create a KV namespace:
+KV is required for MFA-enabled Garmin accounts so the Worker can persist the
+OAuth tokens after the one-time MFA enrollment:
 
 ```bash
 npm run kv:create
@@ -249,6 +250,12 @@ Add the generated namespace ID to `wrangler.jsonc`:
 ]
 ```
 
+Also set a separate secret used only for the MFA enrollment endpoints:
+
+```bash
+npx wrangler secret put MFA_ADMIN_TOKEN
+```
+
 ### 3. Deploy
 
 ```bash
@@ -256,6 +263,45 @@ npm run deploy
 ```
 
 Once deployed, your worker URL (`https://garmin-connect-mcp.<subdomain>.workers.dev`) can be used as an HTTP/SSE MCP endpoint in compatible MCP clients.
+
+### 4. Initialize MFA for a Worker
+
+Gemini Spark can send the Garmin email and password, but it cannot answer an
+interactive MFA prompt from inside a Worker request. Start the enrollment
+from a trusted terminal instead. The Worker will use the `GARMIN_EMAIL` and
+`GARMIN_PASSWORD` secrets configured above:
+
+PowerShell:
+
+```powershell
+$workerUrl = "https://garmin-connect-mcp.<subdomain>.workers.dev"
+$headers = @{ "x-mfa-admin-token" = "your-MFA_ADMIN_TOKEN"; "Content-Type" = "application/json" }
+
+$start = Invoke-RestMethod `
+  -Uri "$workerUrl/auth/mfa/start" `
+  -Method Post `
+  -Headers $headers `
+  -Body '{}'
+
+$start
+```
+
+Check the Garmin email, then submit the latest code:
+
+```powershell
+$verifyBody = @{ challengeId = $start.challengeId; code = "123456" } | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "$workerUrl/auth/mfa/verify" `
+  -Method Post `
+  -Headers $headers `
+  -Body $verifyBody
+```
+
+After `status: authenticated` is returned, connect the Worker URL in Gemini
+Spark and enter the Garmin email and password in its credential fields. The
+Worker will load the saved token from KV. Do not send the MFA code through the
+Gemini conversation.
 
 ## Credits
 

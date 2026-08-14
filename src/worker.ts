@@ -1,13 +1,21 @@
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
-import { GarminClient, KVTokenStorage, MemoryTokenStorage, type KVNamespaceBinding } from './client';
+import {
+  GarminAuth,
+  GarminClient,
+  KVTokenStorage,
+  MemoryTokenStorage,
+  type GarminMfaChallenge,
+  type KVNamespaceBinding,
+} from './client';
 import { createGarminMcpServer } from './server';
 
 export interface Env {
   GARMIN_EMAIL?: string;
   GARMIN_PASSWORD?: string;
   AUTH_TOKEN?: string;
+  MFA_ADMIN_TOKEN?: string;
   GARMIN_TOKENS?: KVNamespaceBinding;
 }
 
@@ -52,12 +60,14 @@ type SessionRecord = {
 
 const activeSessions = new Map<string, SessionRecord>();
 const memoryStorage = new MemoryTokenStorage();
+const MFA_CHALLENGE_PREFIX = 'garmin_mfa:';
+const MFA_CHALLENGE_TTL_SECONDS = 10 * 60;
 
 function corsHeaders(origin?: string | null): Record<string, string> {
   return {
     'Access-Control-Allow-Origin': origin || '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, x-api-key',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, x-api-key, x-mfa-admin-token',
     'Access-Control-Expose-Headers': 'Mcp-Session-Id',
   };
 }
@@ -89,6 +99,57 @@ function decodeOAuthBearerToken(bearerToken: string): { email: string; password:
   return null;
 }
 
+function jsonResponse(
+  body: Record<string, unknown>,
+  status: number,
+  headers: Record<string, string>,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...headers, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+}
+
+function hasMfaAdminAccess(request: Request, env: Env): boolean {
+  const configuredToken = env.MFA_ADMIN_TOKEN;
+  const providedToken = request.headers.get('x-mfa-admin-token');
+  return !!configuredToken && !!providedToken && providedToken === configuredToken;
+}
+
+async function parseJsonBody(request: Request): Promise<Record<string, unknown>> {
+  try {
+    const body = await request.json();
+    return body && typeof body === 'object' ? body as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function getMfaCredentials(
+  body: Record<string, unknown>,
+  env: Env,
+): { email: string; password: string } | null {
+  const email = stringValue(body.email) ?? env.GARMIN_EMAIL;
+  const password = stringValue(body.password) ?? env.GARMIN_PASSWORD;
+  return email && password ? { email, password } : null;
+}
+
+function isGarminMfaChallenge(value: unknown): value is GarminMfaChallenge {
+  if (!value || typeof value !== 'object') return false;
+  const challenge = value as Partial<GarminMfaChallenge>;
+  return challenge.version === 1
+    && typeof challenge.email === 'string'
+    && typeof challenge.createdAt === 'number'
+    && typeof challenge.expiresAt === 'number'
+    && typeof challenge.mfaCsrfToken === 'string'
+    && !!challenge.signinParams
+    && !!challenge.cookieJar;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -111,12 +172,158 @@ export default {
             message: `${url.origin}/message`,
             mcp: url.origin,
             health: `${url.origin}/health`,
+            mfaStart: `${url.origin}/auth/mfa/start`,
+            mfaVerify: `${url.origin}/auth/mfa/verify`,
           },
         }),
         {
           status: 200,
           headers: { ...headers, 'Content-Type': 'application/json' },
         },
+      );
+    }
+
+    // ─── Remote MFA enrollment ───
+    // This is intentionally separate from the MCP transport. Gemini Spark
+    // can provide credentials, but it cannot answer an interactive OTP
+    // prompt while a Garmin login is in progress.
+    if (url.pathname === '/auth/mfa/start' || url.pathname === '/auth/mfa/verify') {
+      if (!env.MFA_ADMIN_TOKEN) {
+        return jsonResponse(
+          { error: 'MFA enrollment is not configured. Set the MFA_ADMIN_TOKEN Worker secret.' },
+          503,
+          headers,
+        );
+      }
+
+      if (!hasMfaAdminAccess(request, env)) {
+        return jsonResponse({ error: 'Unauthorized' }, 401, headers);
+      }
+
+      if (!env.GARMIN_TOKENS) {
+        return jsonResponse(
+          { error: 'MFA enrollment requires the GARMIN_TOKENS KV binding.' },
+          503,
+          headers,
+        );
+      }
+
+      const tokenStorage = new KVTokenStorage(env.GARMIN_TOKENS);
+
+      if (url.pathname === '/auth/mfa/start' && request.method === 'POST') {
+        const body = await parseJsonBody(request);
+        const credentials = getMfaCredentials(body, env);
+        if (!credentials) {
+          return jsonResponse(
+            { error: 'Provide email and password in the request body or configure GARMIN_EMAIL and GARMIN_PASSWORD.' },
+            400,
+            headers,
+          );
+        }
+
+        try {
+          const auth = new GarminAuth(credentials.email, credentials.password, undefined, tokenStorage);
+          const challenge = await auth.startMfaLogin();
+
+          if (!challenge) {
+            return jsonResponse(
+              { status: 'authenticated', mfaRequired: false, displayName: auth.displayName },
+              200,
+              headers,
+            );
+          }
+
+          const challengeId = crypto.randomUUID();
+          await env.GARMIN_TOKENS.put(
+            `${MFA_CHALLENGE_PREFIX}${challengeId}`,
+            JSON.stringify(challenge),
+            { expirationTtl: MFA_CHALLENGE_TTL_SECONDS },
+          );
+
+          return jsonResponse(
+            {
+              status: 'mfa_required',
+              mfaRequired: true,
+              challengeId,
+              expiresIn: MFA_CHALLENGE_TTL_SECONDS,
+              message: 'Check your Garmin email and submit the latest verification code to /auth/mfa/verify.',
+            },
+            200,
+            headers,
+          );
+        } catch (error) {
+          console.error('Remote MFA start failed:', error instanceof Error ? error.message : error);
+          return jsonResponse(
+            { error: error instanceof Error ? error.message : 'Failed to start Garmin MFA login' },
+            400,
+            headers,
+          );
+        }
+      }
+
+      if (url.pathname === '/auth/mfa/verify' && request.method === 'POST') {
+        const body = await parseJsonBody(request);
+        const challengeId = stringValue(body.challengeId);
+        const code = stringValue(body.code);
+
+        if (!challengeId || !code) {
+          return jsonResponse(
+            { error: 'challengeId and code are required' },
+            400,
+            headers,
+          );
+        }
+
+        const challengeKey = `${MFA_CHALLENGE_PREFIX}${challengeId}`;
+        const storedChallenge = await env.GARMIN_TOKENS.get(challengeKey);
+        if (!storedChallenge) {
+          return jsonResponse(
+            { error: 'MFA challenge was not found or has expired' },
+            404,
+            headers,
+          );
+        }
+
+        let challenge: unknown;
+        try {
+          challenge = JSON.parse(storedChallenge);
+        } catch {
+          return jsonResponse({ error: 'MFA challenge is invalid' }, 400, headers);
+        }
+
+        if (!isGarminMfaChallenge(challenge)) {
+          return jsonResponse({ error: 'MFA challenge is invalid' }, 400, headers);
+        }
+
+        if (Date.now() >= challenge.expiresAt) {
+          await env.GARMIN_TOKENS.delete?.(challengeKey);
+          return jsonResponse({ error: 'MFA challenge has expired' }, 410, headers);
+        }
+
+        try {
+          const auth = new GarminAuth(challenge.email, '', undefined, tokenStorage);
+          await auth.verifyMfa(challenge, code);
+          await env.GARMIN_TOKENS.delete?.(challengeKey);
+
+          return jsonResponse(
+            { status: 'authenticated', mfaRequired: false, displayName: auth.displayName },
+            200,
+            headers,
+          );
+        } catch (error) {
+          console.error('Remote MFA verification failed:', error instanceof Error ? error.message : error);
+          return jsonResponse(
+            { error: error instanceof Error ? error.message : 'MFA verification failed' },
+            400,
+            headers,
+          );
+        }
+      }
+
+      return jsonResponse(
+        { error: 'Method not allowed' },
+        405,
+        { ...headers, Allow: 'POST, OPTIONS' },
       );
     }
 

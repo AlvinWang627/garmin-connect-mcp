@@ -8,5 +8,11 @@
   ],
   "observability": {
     "enabled": true
-  }
+  },
+    "kv_namespaces": [
+    {
+      "binding": "GARMIN_TOKENS",
+      "id": "3eea8a0fc07d4bd5971c04d8c0b4da06"
+    }
+  ]
 }
